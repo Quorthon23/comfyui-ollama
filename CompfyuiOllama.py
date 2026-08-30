@@ -59,6 +59,65 @@ def _filter_enabled_options(options: dict[str, Any] | None) -> dict[str, Any] | 
             out[key] = options[key]
     return out or None
 
+
+def _encode_images(images: Any, kwargs: dict[str, Any]) -> list[str] | None:
+    """Helper to extract, flatten, and base64-encode image tensors/lists for Ollama."""
+    raw_images: list[Any] = []
+
+    def collect(item: Any):
+        if item is None:
+            return
+        if isinstance(item, (list, tuple)):
+            for sub in item:
+                collect(sub)
+        else:
+            raw_images.append(item)
+
+    collect(images)
+    for k, v in kwargs.items():
+        if k.startswith("image"):
+            collect(v)
+
+    if not raw_images:
+        return None
+
+    images_b64: list[str] = []
+    for img_obj in raw_images:
+        if hasattr(img_obj, "dim"):
+            dim = img_obj.dim()
+            if dim == 4:
+                tensor_list = [img_obj[b] for b in range(img_obj.shape[0])]
+            elif dim == 3:
+                tensor_list = [img_obj]
+            else:
+                continue
+        elif isinstance(img_obj, np.ndarray):
+            if img_obj.ndim == 4:
+                tensor_list = [img_obj[b] for b in range(img_obj.shape[0])]
+            elif img_obj.ndim == 3:
+                tensor_list = [img_obj]
+            else:
+                continue
+        else:
+            continue
+
+        for img_tensor in tensor_list:
+            if hasattr(img_tensor, "cpu"):
+                array = img_tensor.cpu().numpy()
+            else:
+                array = img_tensor
+            i = 255.0 * array
+            img = Image.fromarray(np.clip(i, 0, 255).astype(np.uint8))
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            buffered = BytesIO()
+            img.save(buffered, format="PNG")
+            img_bytes = base64.b64encode(buffered.getvalue()).decode("utf-8")
+            images_b64.append(img_bytes)
+
+    return images_b64 if images_b64 else None
+
+
 @PromptServer.instance.routes.post("/ollama/get_models")
 async def get_models_endpoint(request):
     data = await request.json()
@@ -262,7 +321,13 @@ class OllamaGenerateV2:
             "optional": {
                 "connectivity": ("OLLAMA_CONNECTIVITY", {"forceInput": False, "tooltip": "Set an ollama provider for the generation. If this input is empty, the 'meta' input must be set."},),
                 "options": ("OLLAMA_OPTIONS", {"forceInput": False, "tooltip": "Connect an Ollama Options node for advanced inference configuration."},),
-                "images": ("IMAGE", {"forceInput": False, "tooltip": "Provide an image or a batch of images for vision tasks. Make sure that the selected model supports vision, otherwise it may hallucinate the response."},),
+                "images": ("COMFY_AUTOGROW_V3", {
+                    "template": {
+                        "input": {"required": {"image": ("IMAGE", {"tooltip": "Provide an image or a batch of images for vision tasks. Make sure that the selected model supports vision, otherwise it may hallucinate the response."})}},
+                        "names": ["images"] + [f"image_{i}" for i in range(2, 40)],
+                        "min": 0
+                    }
+                }),
                 "context": ("OLLAMA_CONTEXT", {"forceInput": False, "tooltip": "Optionally set an existing model context, useful for multi-turn conversations, follow-up questions."},),
                 "meta": ("OLLAMA_META", {"forceInput": False, "tooltip": "Use this input to chain multiple 'Ollama Generate' nodes. In this case the connectivity and options inputs are passed along."},),
             }
@@ -295,7 +360,7 @@ class OllamaGenerateV2:
 
         return response
 
-    def ollama_generate_v2(self, system, prompt, think, keep_context, format, context = None, options=None, connectivity=None, images=None, meta=None):
+    def ollama_generate_v2(self, system, prompt, think, keep_context, format, context = None, options=None, connectivity=None, images=None, meta=None, **kwargs):
 
         if connectivity is None and meta is None:
             raise Exception("Required input connectivity or meta.")
@@ -332,16 +397,7 @@ class OllamaGenerateV2:
 
         request_options = self.get_request_options(options)
 
-        images_b64 = None
-        if images is not None:
-            images_b64 = []
-            for (batch_number, image) in enumerate(images):
-                i = 255. * image.cpu().numpy()
-                img = Image.fromarray(np.clip(i, 0, 255).astype(np.uint8))
-                buffered = BytesIO()
-                img.save(buffered, format="PNG")
-                img_bytes = base64.b64encode(buffered.getvalue())
-                images_b64.append(str(img_bytes, 'utf-8'))
+        images_b64 = _encode_images(images, kwargs)
 
         if debug_print:
             print(f"""
@@ -360,7 +416,9 @@ format: {format}
 ---------------------------------------------------------
 """)
 
+        print(f"[Ollama] Generate: requesting '{model}' with {0 if images_b64 is None else len(images_b64)} image(s)...")
         response = client.generate(
+
             model=model,
             system=system,
             prompt=prompt,
@@ -386,6 +444,11 @@ format: {format}
                 print("saving context to node memory.")
 
         return ollama_response_text, ollama_response_thinking, response['context'], meta,
+
+    @classmethod
+    def IS_CHANGED(s, **kwargs):
+        return float("NaN")
+
 
 
 class OllamaChat:
@@ -444,10 +507,13 @@ class OllamaChat:
                     },
                 ),
                 "images": (
-                    "IMAGE",
+                    "COMFY_AUTOGROW_V3",
                     {
-                        "forceInput": False,
-                        "tooltip": "Provide an image or a batch of images for vision tasks. Make sure that the selected model supports vision, otherwise it may hallucinate the response.",
+                        "template": {
+                            "input": {"required": {"image": ("IMAGE", {"tooltip": "Provide an image or a batch of images for vision tasks. Make sure that the selected model supports vision, otherwise it may hallucinate the response."})}},
+                            "names": ["images"] + [f"image_{i}" for i in range(2, 40)],
+                            "min": 0
+                        }
                     },
                 ),
                 "meta": (
@@ -504,6 +570,7 @@ class OllamaChat:
         meta: dict[str, Any] | None = None,
         history: str | None = None,
         reset_session: bool = False,
+        **kwargs
     ) -> tuple[str | None, str | None, dict[str, Any], str | None]:
 
         if meta is None:
@@ -546,16 +613,7 @@ class OllamaChat:
         # 4. use the shared helper instead of self.get_request_options
         request_options = _filter_enabled_options(options)
 
-        images_b64: list[str] | None = None
-        if images is not None:
-            images_b64 = []
-            for batch_number, image in enumerate(images):
-                i = 255.0 * image.cpu().numpy()
-                img = Image.fromarray(np.clip(i, 0, 255).astype(np.uint8))
-                buffered = BytesIO()
-                img.save(buffered, format="PNG")
-                img_bytes = base64.b64encode(buffered.getvalue()).decode("utf-8")
-                images_b64.append(img_bytes)
+        images_b64 = _encode_images(images, kwargs)
 
         if debug_print:
             print(
@@ -625,7 +683,9 @@ format: {format}
         if images_b64 is not None:
             messages_for_api[-1]["images"] = images_b64
 
+        print(f"[Ollama] Chat: requesting '{model}' with {0 if images_b64 is None else len(images_b64)} image(s)...")
         response = client.chat(
+
             model=model,
             messages=messages_for_api,
             options=request_options,
@@ -655,6 +715,11 @@ format: {format}
             meta,
             history,
         )
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("NaN")
+
 
 
 NODE_CLASS_MAPPINGS = {
