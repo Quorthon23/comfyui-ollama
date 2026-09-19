@@ -1,7 +1,12 @@
 from __future__ import annotations
 import copy
+import json
 import random
 import re
+import urllib.error
+import urllib.parse
+import urllib.request
+import aiohttp
 
 from ollama import Client
 import numpy as np
@@ -133,6 +138,480 @@ async def get_models_endpoint(request):
     except Exception as e:
         models = [model['name'] for model in models]
         return web.json_response(models)
+
+
+def _get_unsloth_auth_headers(api_key: str = "") -> dict[str, str]:
+    headers = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+        return headers
+    try:
+        db_path = os.path.expanduser("~/.unsloth/studio/auth/auth.db")
+        if os.path.exists(db_path):
+            import sqlite3
+            import jwt
+            from datetime import datetime, timezone, timedelta
+            conn = sqlite3.connect(db_path)
+            row = conn.execute("SELECT jwt_secret FROM auth_user WHERE username='unsloth'").fetchone()
+            if row and row[0]:
+                secret = row[0]
+                payload = {
+                    "sub": "unsloth",
+                    "desktop": True,
+                    "exp": datetime.now(timezone.utc) + timedelta(hours=2),
+                }
+                token = jwt.encode(payload, secret, algorithm="HS256")
+                headers["Authorization"] = f"Bearer {token}"
+    except Exception:
+        pass
+    return headers
+
+
+@PromptServer.instance.routes.post("/unsloth/get_models")
+async def unsloth_get_models_endpoint(request):
+    data = await request.json()
+    url = data.get("url", "http://127.0.0.1:8888").rstrip("/")
+    api_key = data.get("api_key", "").strip()
+
+    if not url.endswith("/v1"):
+        endpoint = f"{url}/v1/models"
+    else:
+        endpoint = f"{url}/models"
+
+    headers = _get_unsloth_auth_headers(api_key)
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(endpoint, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    res_data = await resp.json()
+                    models_list = res_data.get("data", [])
+                    models = [m.get("id") for m in models_list if isinstance(m, dict) and "id" in m]
+                    return web.json_response(models)
+                else:
+                    err_text = await resp.text()
+                    return web.json_response({"error": f"HTTP {resp.status}: {err_text}"}, status=resp.status)
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+
+@PromptServer.instance.routes.post("/unsloth/get_variants")
+async def unsloth_get_variants_endpoint(request):
+    data = await request.json()
+    url = data.get("url", "http://127.0.0.1:8888").rstrip("/")
+    api_key = data.get("api_key", "").strip()
+    model = data.get("model", "").strip()
+
+    if not model:
+        return web.json_response([])
+
+    base_url = url[:-3] if url.endswith("/v1") else url
+    headers = _get_unsloth_auth_headers(api_key)
+    quoted_model = urllib.parse.quote(model, safe="")
+
+    variants_data = None
+    try:
+        async with aiohttp.ClientSession() as session:
+            # Query ONLY local cache on device (do not fetch remote undownloaded variants)
+            local_ep = f"{base_url}/api/models/gguf-variants?repo_id={quoted_model}&prefer_local_cache=true"
+            async with session.get(local_ep, headers=headers, timeout=aiohttp.ClientTimeout(total=4)) as resp:
+                if resp.status == 200:
+                    variants_data = await resp.json()
+    except Exception:
+        pass
+
+    if not variants_data or "variants" not in variants_data:
+        return web.json_response([])
+
+    raw_variants = variants_data.get("variants", [])
+    downloaded = []
+    for v in raw_variants:
+        quant = v.get("quant")
+        if not quant:
+            continue
+        if v.get("downloaded"):
+            downloaded.append(quant)
+
+    return web.json_response(downloaded)
+
+
+@PromptServer.instance.routes.post("/unsloth/load_model")
+async def unsloth_load_model_endpoint(request):
+    data = await request.json()
+    url = data.get("url", "http://127.0.0.1:8888").rstrip("/")
+    api_key = data.get("api_key", "").strip()
+    model = data.get("model", "").strip()
+    quantization = data.get("quantization", "").strip()
+    variant = quantization.split(" ")[0].strip() if quantization and quantization != "default" else ""
+    context_length = data.get("context_length", 32768)
+
+    if not model:
+        return web.json_response({"error": "No model specified"}, status=400)
+
+    if not url.endswith("/v1"):
+        endpoint = f"{url}/v1/load"
+    else:
+        endpoint = f"{url}/load"
+
+    headers = _get_unsloth_auth_headers(api_key)
+    headers["Content-Type"] = "application/json"
+
+    payload = {
+        "model_path": model,
+        "speculative_type": "off",
+        "force_cancel_active": True,
+    }
+    if variant:
+        payload["gguf_variant"] = variant
+    if context_length and int(context_length) > 0:
+        payload["max_seq_length"] = int(context_length)
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(endpoint, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=600)) as resp:
+                if resp.status == 200:
+                    res_text = await resp.text()
+                    res_data = json.loads(res_text.strip())
+                    if "_deferred_error" in res_data:
+                        err_info = res_data["_deferred_error"]
+                        detail = err_info.get("detail", str(err_info))
+                        return web.json_response({"error": f"Load error: {detail}"}, status=500)
+                    return web.json_response({"status": "ok", "data": res_data})
+                else:
+                    err_text = await resp.text()
+                    return web.json_response({"error": f"HTTP {resp.status}: {err_text}"}, status=resp.status)
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+
+@PromptServer.instance.routes.post("/unsloth/unload_model")
+async def unsloth_unload_model_endpoint(request):
+    data = await request.json()
+    url = data.get("url", "http://127.0.0.1:8888").rstrip("/")
+    api_key = data.get("api_key", "").strip()
+    model = data.get("model", "").strip()
+
+    if not model:
+        return web.json_response({"error": "No model specified"}, status=400)
+
+    if not url.endswith("/v1"):
+        endpoint = f"{url}/v1/unload"
+    else:
+        endpoint = f"{url}/unload"
+
+    headers = _get_unsloth_auth_headers(api_key)
+    headers["Content-Type"] = "application/json"
+
+    payload = {
+        "model_path": model,
+        "force_cancel_active": True,
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(endpoint, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                if resp.status == 200:
+                    res_text = await resp.text()
+                    res_data = json.loads(res_text.strip())
+                    return web.json_response({"status": "ok", "data": res_data})
+                else:
+                    err_text = await resp.text()
+                    return web.json_response({"error": f"HTTP {resp.status}: {err_text}"}, status=resp.status)
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+
+def _unsloth_configure_auto_unload(
+    url: str,
+    api_key: str,
+    keep_alive: int,
+    keep_alive_unit: str = "minutes",
+    debug: bool = False,
+) -> None:
+    """Configure Unsloth server-side idle auto-unload timeout (PUT /api/settings/openai-auto-switch)."""
+    base_url = url.rstrip("/")
+    if base_url.endswith("/v1"):
+        base_url = base_url[:-3]
+    endpoint = f"{base_url}/api/settings/openai-auto-switch"
+
+    headers = _get_unsloth_auth_headers(api_key)
+    headers["Content-Type"] = "application/json"
+
+    if keep_alive > 0:
+        idle_seconds = keep_alive * 60 if keep_alive_unit == "minutes" else keep_alive * 3600
+        payload = {
+            "enabled": True,
+            "auto_unload_idle_seconds": idle_seconds,
+            "auto_unload_api_only": False,
+        }
+    elif keep_alive == 0:
+        return
+    else:
+        payload = {
+            "enabled": False,
+            "auto_unload_idle_seconds": 0,
+            "auto_unload_api_only": False,
+        }
+
+    req = urllib.request.Request(
+        endpoint,
+        data=json.dumps(payload).encode("utf-8"),
+        headers=headers,
+        method="PUT"
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            if debug:
+                print("[Unsloth] Auto-unload configuration updated:", data)
+    except Exception as e:
+        if debug:
+            print(f"[Unsloth Auto-Unload Warning]: Could not update auto-switch setting: {e}")
+
+
+def _unsloth_unload_model(
+    url: str,
+    api_key: str,
+    model: str,
+    timeout: int = 60,
+    debug: bool = False,
+) -> None:
+    """Explicitly unload model from memory via POST /v1/unload."""
+    if not model:
+        return
+
+    base_url = url.rstrip("/")
+    if not base_url.endswith("/v1"):
+        endpoint = f"{base_url}/v1/unload"
+    else:
+        endpoint = f"{base_url}/unload"
+
+    headers = _get_unsloth_auth_headers(api_key)
+    headers["Content-Type"] = "application/json"
+
+    payload = {
+        "model_path": model,
+        "force_cancel_active": True,
+    }
+
+    req = urllib.request.Request(
+        endpoint,
+        data=json.dumps(payload).encode("utf-8"),
+        headers=headers,
+        method="POST"
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            resp_bytes = resp.read()
+            data = json.loads(resp_bytes.decode("utf-8").strip())
+            if debug:
+                print(f"[Unsloth] Model '{model}' unload response:", data)
+            print(f"[Unsloth] Model '{model}' unloaded from memory.")
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return
+        if debug:
+            err_body = e.read().decode("utf-8", errors="replace")
+            print(f"[Unsloth Unload Warning {e.code}]: {err_body}")
+    except Exception as e:
+        if debug:
+            print(f"[Unsloth Unload Warning]: {str(e)}")
+
+
+def _unsloth_ensure_model_loaded(
+    url: str,
+    api_key: str,
+    model: str,
+    variant: str = "",
+    context_length: int = 32768,
+    debug: bool = False,
+) -> None:
+    """Ensure requested model is loaded into VRAM/memory via POST /v1/load before inference."""
+    if not model:
+        return
+
+    base_url = url.rstrip("/")
+    if not base_url.endswith("/v1"):
+        endpoint = f"{base_url}/v1/load"
+    else:
+        endpoint = f"{base_url}/load"
+
+    headers = _get_unsloth_auth_headers(api_key)
+    headers["Content-Type"] = "application/json"
+
+    payload: dict[str, Any] = {
+        "model_path": model,
+        "speculative_type": "off",
+        "force_cancel_active": True,
+    }
+    if variant:
+        payload["gguf_variant"] = variant
+    if context_length and int(context_length) > 0:
+        payload["max_seq_length"] = int(context_length)
+
+    variant_info = f" ({variant})" if variant else ""
+    ctx_info = f", context: {context_length}" if context_length else ""
+    print(f"[Unsloth] Checking / loading model '{model}'{variant_info}{ctx_info} into memory...")
+    req = urllib.request.Request(
+        endpoint,
+        data=json.dumps(payload).encode("utf-8"),
+        headers=headers,
+        method="POST"
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=None) as resp:
+            resp_bytes = resp.read()
+            # Unsloth pads responses with whitespace while loading
+            data = json.loads(resp_bytes.decode("utf-8").strip())
+            if "_deferred_error" in data:
+                err_info = data["_deferred_error"]
+                detail = err_info.get("detail", str(err_info))
+                raise Exception(f"[Unsloth Load Error]: {detail}")
+            if debug:
+                print(f"[Unsloth] Model '{model}' load response:", data)
+            print(f"[Unsloth] Model '{model}'{variant_info} is loaded and ready.")
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            # Server does not support /v1/load (e.g. generic OpenAI or other backend), ignore
+            return
+        err_body = e.read().decode("utf-8", errors="replace")
+        raise Exception(f"[Unsloth Load Error {e.code}]: {err_body}")
+    except Exception as e:
+        raise e
+
+
+def _unsloth_chat_completion(
+    url: str,
+    api_key: str,
+    model: str,
+    messages: list[dict[str, Any]],
+    variant: str = "",
+    context_length: int = 32768,
+    request_options: dict[str, Any] | None = None,
+    response_format: str | None = None,
+    think: bool = False,
+    debug: bool = False,
+) -> tuple[str, str | None]:
+    # 1. Automatically ensure model is loaded in memory first with specified context length
+    _unsloth_ensure_model_loaded(url, api_key, model, variant=variant, context_length=context_length, debug=debug)
+
+    base_url = url.rstrip("/")
+    if not base_url.endswith("/v1"):
+        endpoint = f"{base_url}/v1/chat/completions"
+    else:
+        endpoint = f"{base_url}/chat/completions"
+
+    headers = _get_unsloth_auth_headers(api_key)
+    headers["Content-Type"] = "application/json"
+
+    # Use streaming for real-time progress and keep-alive stability during generation
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "stream": True,
+    }
+
+    if response_format == "json":
+        payload["response_format"] = {"type": "json_object"}
+
+    if request_options:
+        if "temperature" in request_options:
+            payload["temperature"] = request_options["temperature"]
+        if "top_p" in request_options:
+            payload["top_p"] = request_options["top_p"]
+        if "seed" in request_options:
+            payload["seed"] = request_options["seed"]
+        if "num_predict" in request_options and request_options["num_predict"] > 0:
+            payload["max_tokens"] = request_options["num_predict"]
+        if "stop" in request_options and request_options["stop"]:
+            payload["stop"] = request_options["stop"]
+        if "top_k" in request_options:
+            payload["top_k"] = request_options["top_k"]
+        if "min_p" in request_options:
+            payload["min_p"] = request_options["min_p"]
+        if "repeat_penalty" in request_options:
+            payload["repeat_penalty"] = request_options["repeat_penalty"]
+
+    if debug:
+        print(f"\n--- Unsloth Chat Completion Request:\nURL: {endpoint}\nModel: {model}\nPayload:\n")
+        pprint(payload)
+        print("---------------------------------------------------------")
+
+    variant_info = f" ({variant})" if variant else ""
+    print(f"[Unsloth] Waiting for response from '{model}'{variant_info}...")
+
+    req = urllib.request.Request(
+        endpoint,
+        data=json.dumps(payload).encode("utf-8"),
+        headers=headers,
+        method="POST"
+    )
+
+    content_parts: list[str] = []
+    reasoning_parts: list[str] = []
+
+    try:
+        with urllib.request.urlopen(req, timeout=None) as resp:
+            content_type = resp.headers.get("content-type", "")
+            if "text/event-stream" in content_type:
+                for raw_line in resp:
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if not line or line.startswith(":"):
+                        continue
+                    if line.startswith("data: "):
+                        data_str = line[6:].strip()
+                        if data_str == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(data_str)
+                        except Exception:
+                            continue
+                        choices = chunk.get("choices", [])
+                        if choices:
+                            delta = choices[0].get("delta", {})
+                            c = delta.get("content")
+                            if c:
+                                content_parts.append(c)
+                            r = delta.get("reasoning_content")
+                            if r:
+                                reasoning_parts.append(r)
+                content = "".join(content_parts)
+                reasoning = "".join(reasoning_parts) if reasoning_parts else None
+            else:
+                # Non-streaming JSON fallback
+                data = json.loads(resp.read().decode("utf-8"))
+                choices = data.get("choices", [])
+                if not choices:
+                    raise Exception(f"[Unsloth API] Empty choices returned: {data}")
+                message = choices[0].get("message", {})
+                content = message.get("content", "") or ""
+                reasoning = message.get("reasoning_content")
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode("utf-8", errors="replace")
+        raise Exception(f"[Unsloth API Error {e.code}]: {error_body}")
+    except Exception as e:
+        raise Exception(f"[Unsloth Connection Error]: {str(e)}")
+
+    if debug:
+        print("\n--- Unsloth Chat Completion Response:\n")
+        print(content)
+        if reasoning:
+            print(f"--- Thinking:\n{reasoning}")
+        print("---------------------------------------------------------")
+
+    print(f"[Unsloth] Generation complete ({len(content)} chars received).")
+
+    if not reasoning and ("<think>" in content or "<thinking>" in content):
+        match = re.search(r"<(?:think|thinking)>(.*?)</(?:think|thinking)>", content, flags=re.DOTALL | re.IGNORECASE)
+        if match:
+            reasoning = match.group(1).strip()
+            content = re.sub(r"<(?:think|thinking)>.*?</(?:think|thinking)>\s*", "", content, flags=re.DOTALL | re.IGNORECASE).strip()
+
+    thinking = reasoning if think else None
+    return content, thinking
 
 class OllamaSaveContext:
     def __init__(self):
@@ -286,8 +765,63 @@ class OllamaConnectivityV2:
 
     def ollama_connectivity(self, url, model, keep_alive, keep_alive_unit):
         data = {
+            "provider": "ollama",
             "url": url,
             "model": model,
+            "keep_alive": keep_alive,
+            "keep_alive_unit": keep_alive_unit,
+        }
+
+        return (data,)
+
+
+class UnslothConnectivity:
+    def __init__(self):
+        pass
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "url": ("STRING", {
+                    "multiline": False,
+                    "default": "http://127.0.0.1:8888",
+                    "tooltip": "The URL of the Unsloth server (default http://127.0.0.1:8888 or http://127.0.0.1:8000)."
+                }),
+                "api_key": ("STRING", {
+                    "multiline": False,
+                    "default": "",
+                    "tooltip": "API Key from Unsloth Settings -> API (starts with sk-unsloth-...). Leave empty if no authentication is configured."
+                }),
+                "model": ((), {"tooltip": "Select a model loaded in Unsloth. Use the '🔄 Reconnect' button to refresh the list of available models."}),
+                "quantization": ((), {"tooltip": "Select quantization/variant (e.g. UD-Q4_K_XL). Displays only quantizations already downloaded to device."}),
+                "context_length": ("INT", {"default": 32768, "min": 0, "max": 262144, "step": 1024, "tooltip": "Context window size in tokens (default 32768 = 32K). Set 0 to use model default."}),
+                "keep_alive": ("INT", {"default": 5, "min": -1, "max": 120, "step": 1, "tooltip": "Configures how long Unsloth keeps the model loaded in memory after inference. -1 = keep alive indefinitely, 0 = unload model immediately after inference"}),
+                "keep_alive_unit": (["minutes", "hours"],),
+            },
+        }
+
+    @classmethod
+    def VALIDATE_INPUTS(s, **kwargs):
+        return True
+
+    RETURN_TYPES = ("OLLAMA_CONNECTIVITY",)
+    RETURN_NAMES = ("connection",)
+    FUNCTION = "unsloth_connectivity"
+    CATEGORY = "Ollama"
+    DESCRIPTION = "Provides connection to an Unsloth API server (OpenAI-compatible). Use the Reconnect button to load available models and quantizations."
+
+    def unsloth_connectivity(self, url, api_key, model, quantization="", context_length=32768, keep_alive=5, keep_alive_unit="minutes", **kwargs):
+        clean_variant = ""
+        if quantization and quantization not in ("default", "(none)", "(not downloaded)", "none"):
+            clean_variant = quantization.split(" ")[0].strip()
+        data = {
+            "provider": "unsloth",
+            "url": url,
+            "api_key": api_key,
+            "model": model,
+            "quantization": clean_variant,
+            "context_length": context_length,
             "keep_alive": keep_alive,
             "keep_alive_unit": keep_alive_unit,
         }
@@ -324,7 +858,7 @@ class OllamaGenerateV2:
                 "images": ("COMFY_AUTOGROW_V3", {
                     "template": {
                         "input": {"required": {"image": ("IMAGE", {"tooltip": "Provide an image or a batch of images for vision tasks. Make sure that the selected model supports vision, otherwise it may hallucinate the response."})}},
-                        "names": ["images"] + [f"image_{i}" for i in range(2, 40)],
+                        "names": [f"image_{i}" for i in range(1, 40)],
                         "min": 0
                     }
                 }),
@@ -376,28 +910,126 @@ class OllamaGenerateV2:
         else:
             meta = {"options": options, "connectivity": connectivity}
 
-        url = meta['connectivity']['url']
-        model = meta['connectivity']['model']
-        client = Client(host=url)
+        conn = meta['connectivity']
+        provider = conn.get('provider', 'ollama')
+        url = conn['url']
+        model = conn['model']
 
         debug_print = True if meta['options'] is not None and meta['options']['debug'] else False
 
         if format == "text":
             format = ''
 
+        images_b64 = _encode_images(images, kwargs)
+        request_options = self.get_request_options(options)
+
+        if provider == "unsloth":
+            api_key = conn.get("api_key", "")
+            variant = conn.get("quantization", "")
+            context_length = conn.get("context_length", 32768)
+            if request_options and "num_ctx" in request_options and request_options["num_ctx"] > 0:
+                context_length = request_options["num_ctx"]
+            keep_alive = conn.get("keep_alive", 5)
+            keep_alive_unit = conn.get("keep_alive_unit", "minutes")
+
+            # Configure server idle auto-unload
+            _unsloth_configure_auto_unload(url, api_key, keep_alive, keep_alive_unit, debug=debug_print)
+
+            # Build user content
+            if images_b64:
+                user_content: Any = [{"type": "text", "text": prompt}]
+                for img_b64 in images_b64:
+                    user_content.append({
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{img_b64}"}
+                    })
+            else:
+                user_content = prompt
+
+            user_msg = {"role": "user", "content": user_content}
+
+            # Handle context and conversation history
+            if keep_context and context is None and isinstance(self.saved_context, list):
+                messages = list(self.saved_context)
+                if system:
+                    if messages and messages[0].get("role") == "system":
+                        messages[0] = {"role": "system", "content": system}
+                    else:
+                        messages.insert(0, {"role": "system", "content": system})
+                messages.append(user_msg)
+            else:
+                messages = []
+                if system:
+                    messages.append({"role": "system", "content": system})
+                if context is not None:
+                    if isinstance(context, list) and all(isinstance(m, dict) for m in context):
+                        messages.extend(context)
+                    elif isinstance(context, str):
+                        try:
+                            parsed = json.loads(context)
+                            if isinstance(parsed, list):
+                                messages.extend(parsed)
+                        except Exception:
+                            pass
+                messages.append(user_msg)
+
+            if debug_print:
+                print(f"""
+--- unsloth generate request: 
+url: {url}
+model: {model}
+variant: {variant}
+context_length: {context_length}
+system: {system}
+prompt: {prompt}
+images: {0 if images_b64 is None else len(images_b64)}
+think: {think}
+options: {request_options}
+keep alive: {keep_alive} {keep_alive_unit}
+format: {format}
+---------------------------------------------------------
+""")
+
+            variant_info = f" ({variant})" if variant else ""
+            print(f"[Unsloth] Generate: requesting '{model}'{variant_info} with {0 if images_b64 is None else len(images_b64)} image(s)...")
+            res_text, res_thinking = _unsloth_chat_completion(
+                url=url,
+                api_key=api_key,
+                model=model,
+                messages=messages,
+                variant=variant,
+                context_length=context_length,
+                request_options=request_options,
+                response_format=format,
+                think=think,
+                debug=debug_print,
+            )
+
+            # If keep_alive == 0, immediately unload the model from memory
+            if keep_alive == 0:
+                _unsloth_unload_model(url, api_key, model, debug=debug_print)
+
+            # Update context
+            messages.append({"role": "assistant", "content": res_text})
+            if keep_context:
+                self.saved_context = messages
+                if debug_print:
+                    print("saving context to node memory.")
+
+            return res_text, res_thinking, messages, meta
+
+        # Ollama provider branch
+        client = Client(host=url)
+
         if context is not None and isinstance(context, str):
             string_list = context.split(',')
-            context = [int(item.strip()) for item in string_list]
+            context = [int(item.strip()) for item in string_list if item.strip().isdigit()]
 
         if keep_context and context is None:
             context = self.saved_context
 
-        keep_alive_unit =  'm' if meta['connectivity']['keep_alive_unit'] == "minutes" else 'h'
-        request_keep_alive = str(meta['connectivity']['keep_alive']) + keep_alive_unit
-
-        request_options = self.get_request_options(options)
-
-        images_b64 = _encode_images(images, kwargs)
+        keep_alive_unit = 'm' if conn.get('keep_alive_unit') == "minutes" else 'h'
+        request_keep_alive = str(conn.get('keep_alive', 5)) + keep_alive_unit
 
         if debug_print:
             print(f"""
@@ -418,7 +1050,6 @@ format: {format}
 
         print(f"[Ollama] Generate: requesting '{model}' with {0 if images_b64 is None else len(images_b64)} image(s)...")
         response = client.generate(
-
             model=model,
             system=system,
             prompt=prompt,
@@ -426,7 +1057,7 @@ format: {format}
             context=context,
             think=think,
             options=request_options,
-            keep_alive= request_keep_alive,
+            keep_alive=request_keep_alive,
             format=format,
         )
 
@@ -444,11 +1075,6 @@ format: {format}
                 print("saving context to node memory.")
 
         return ollama_response_text, ollama_response_thinking, response['context'], meta,
-
-    @classmethod
-    def IS_CHANGED(s, **kwargs):
-        return float("NaN")
-
 
 
 class OllamaChat:
@@ -511,7 +1137,7 @@ class OllamaChat:
                     {
                         "template": {
                             "input": {"required": {"image": ("IMAGE", {"tooltip": "Provide an image or a batch of images for vision tasks. Make sure that the selected model supports vision, otherwise it may hallucinate the response."})}},
-                            "names": ["images"] + [f"image_{i}" for i in range(2, 40)],
+                            "names": [f"image_{i}" for i in range(1, 40)],
                             "min": 0
                         }
                     },
@@ -676,8 +1302,63 @@ format: {format}
                         pprint(f"Image: {image[:50]}...")
             print("---------------------------------------------------------")
 
+        conn = meta['connectivity']
+        provider = conn.get('provider', 'ollama')
+
         # Construct the messages for the API call (with images)
         messages_for_api = copy.deepcopy(session.messages)
+
+        if provider == "unsloth":
+            api_key = conn.get("api_key", "")
+            variant = conn.get("quantization", "")
+            context_length = conn.get("context_length", 32768)
+            if request_options and "num_ctx" in request_options and request_options["num_ctx"] > 0:
+                context_length = request_options["num_ctx"]
+            keep_alive = conn.get("keep_alive", 5)
+            keep_alive_unit = conn.get("keep_alive_unit", "minutes")
+
+            # Configure server idle auto-unload
+            _unsloth_configure_auto_unload(url, api_key, keep_alive, keep_alive_unit, debug=debug_print)
+
+            if images_b64 is not None:
+                content_parts = [{"type": "text", "text": prompt}]
+                for img_b64 in images_b64:
+                    content_parts.append({
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{img_b64}"}
+                    })
+                messages_for_api[-1]["content"] = content_parts
+
+            variant_info = f" ({variant})" if variant else ""
+            print(f"[Unsloth] Chat: requesting '{model}'{variant_info} with {0 if images_b64 is None else len(images_b64)} image(s)...")
+            res_text, res_thinking = _unsloth_chat_completion(
+                url=url,
+                api_key=api_key,
+                model=model,
+                messages=messages_for_api,
+                variant=variant,
+                context_length=context_length,
+                request_options=request_options,
+                response_format=format,
+                think=think,
+                debug=debug_print,
+            )
+
+            # If keep_alive == 0, immediately unload the model from memory
+            if keep_alive == 0:
+                _unsloth_unload_model(url, api_key, model, debug=debug_print)
+
+            session.messages.append({
+                "role": "assistant",
+                "content": res_text,
+            })
+
+            return (
+                res_text,
+                res_thinking,
+                meta,
+                history,
+            )
 
         # If there are images, modify the last user message for the API call
         if images_b64 is not None:
@@ -716,15 +1397,11 @@ format: {format}
             history,
         )
 
-    @classmethod
-    def IS_CHANGED(cls, **kwargs):
-        return float("NaN")
-
-
 
 NODE_CLASS_MAPPINGS = {
     "OllamaOptionsV2": OllamaOptionsV2,
     "OllamaConnectivityV2": OllamaConnectivityV2,
+    "UnslothConnectivity": UnslothConnectivity,
     "OllamaGenerateV2": OllamaGenerateV2,
     "OllamaSaveContext": OllamaSaveContext,
     "OllamaLoadContext": OllamaLoadContext,
@@ -734,6 +1411,7 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "OllamaOptionsV2": "Ollama Options",
     "OllamaConnectivityV2": "Ollama Connectivity",
+    "UnslothConnectivity": "Unsloth Connectivity",
     "OllamaGenerateV2": "Ollama Generate",
     "OllamaSaveContext": "Ollama Save Context",
     "OllamaLoadContext": "Ollama Load Context",
